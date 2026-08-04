@@ -12,6 +12,38 @@ and features common algorithms for robot learning.
 - **High-throughput training** with native Multi-GPU support.
 - **Proven performance** in numerous research publications.
 
+## Fork Extension: Fixed-Weight Multi-Critic PPO
+
+This fork adds `MultiCriticPPO`: one actor with an ordered independent scalar critic per objective. It uses the stock
+`OnPolicyRunner`; only the algorithm configuration and environment extras contract change:
+
+The reusable aggregation follows
+[HoST's fixed multi-critic implementation](https://github.com/InternRobotics/HoST/tree/70bb580949a336a920833700e4b5dc3bf7fe87ce/rsl_rl),
+without its task-specific interpolation losses.
+
+```python
+train_cfg["algorithm"] = {
+    "class_name": "MultiCriticPPO",
+    "objective_names": ("locomotion", "manipulation", "tracking"),
+    "reward_group_weights": (0.5, 1.5, 2.0),
+    "normalize_advantage_per_mini_batch": False,
+    "share_cnn_encoders": False,
+    "rnd_cfg": None,
+    "symmetry_cfg": None,
+    # ordinary PPO settings ...
+}
+```
+
+The environment must return `extras["objective_rewards"]` as a floating tensor with exact shape
+`[num_envs, num_objectives]`. Its final axis follows `objective_names` exactly; the ordinary scalar `rewards` tensor is
+left unchanged for runner logging. Each objective GAE is normalized over the completed rollout, then
+`reward_group_weights` forms the actor advantage. Checkpoints store and require exact objective order and weight values.
+
+Feed-forward models and `torch.compile` are supported. Actor/critic broadcast and gradient all-reduce use the stock
+multi-GPU lifecycle; this fork's tests cover those hooks, not a multi-process NCCL run. Recurrent models, RND, symmetry,
+per-mini-batch advantage normalization, and shared actor/critic parameters are intentionally rejected because they do
+not yet have an unambiguous multi-critic contract.
+
 ## Learning Environments
 
 RSL-RL is currently used by the following robot learning libraries:
