@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 import pytest
 
-from rsl_rl.algorithms import OBJECTIVE_REWARDS_KEY, MultiCriticPPO
+from rsl_rl.algorithms import MultiCriticPPO
 from rsl_rl.models import MLPModel
 from rsl_rl.storage import MultiCriticRolloutStorage
 from tests.conftest import make_obs
@@ -24,6 +24,11 @@ REWARD_GROUP_WEIGHTS = torch.tensor([0.5, 1.5, 2.0])
 NUM_ENVS = 4
 NUM_STEPS = 3
 NUM_ACTIONS = 2
+
+
+def _objective_reward_mapping(rewards: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Return named rewards in reverse order to exercise name-based routing."""
+    return {name: rewards[:, objective_index] for objective_index, name in reversed(tuple(enumerate(OBJECTIVE_NAMES)))}
 
 
 def _build_algorithm(
@@ -79,7 +84,7 @@ def _collect_rollout(algorithm: MultiCriticPPO, obs: TensorDict) -> None:
             obs,
             torch.zeros(NUM_ENVS),
             torch.zeros(NUM_ENVS),
-            {OBJECTIVE_REWARDS_KEY: objective_rewards},
+            {"objective_rewards": _objective_reward_mapping(objective_rewards)},
         )
     algorithm.compute_returns(obs)
 
@@ -124,24 +129,68 @@ def test_timeout_bootstraps_each_objective_reward_from_its_critic() -> None:
         obs,
         torch.full((NUM_ENVS,), -123.0),
         torch.ones(NUM_ENVS),
-        {OBJECTIVE_REWARDS_KEY: objective_rewards, "time_outs": time_outs},
+        {"objective_rewards": _objective_reward_mapping(objective_rewards), "time_outs": time_outs},
     )
 
     expected = objective_rewards + algorithm.gamma * values * time_outs.view(-1, 1)
     torch.testing.assert_close(algorithm.storage.rewards[0], expected)
 
 
-def test_objective_reward_extras_require_exact_env_and_objective_axes() -> None:
-    """Near-miss extras tensors cannot silently broadcast or reorder the objective axis."""
+@pytest.mark.parametrize(
+    "objective_rewards",
+    [
+        {name: torch.zeros(NUM_ENVS) for name in OBJECTIVE_NAMES[:-1]},
+        {**{name: torch.zeros(NUM_ENVS) for name in OBJECTIVE_NAMES}, "style": torch.zeros(NUM_ENVS)},
+    ],
+)
+def test_objective_reward_names_must_match(objective_rewards: dict[str, torch.Tensor]) -> None:
+    """Missing or extra objective names are rejected independently of mapping order."""
     algorithm, obs = _build_algorithm()
     algorithm.act(obs)
 
-    with pytest.raises(ValueError, match=r"objective_rewards.*shape"):
+    with pytest.raises(ValueError, match="names do not match"):
         algorithm.process_env_step(
             obs,
             torch.zeros(NUM_ENVS),
             torch.zeros(NUM_ENVS),
-            {OBJECTIVE_REWARDS_KEY: torch.zeros(NUM_ENVS, len(OBJECTIVE_NAMES) - 1)},
+            {"objective_rewards": objective_rewards},
+        )
+
+
+@pytest.mark.parametrize(
+    ("reward", "message"),
+    [
+        (torch.zeros(NUM_ENVS, 1), "must have shape"),
+        (torch.zeros(NUM_ENVS, dtype=torch.long), "floating dtype"),
+    ],
+)
+def test_objective_reward_values_require_vector_floats(reward: torch.Tensor, message: str) -> None:
+    """Every named objective owns one floating reward per environment."""
+    algorithm, obs = _build_algorithm()
+    algorithm.act(obs)
+    objective_rewards = {name: torch.zeros(NUM_ENVS) for name in OBJECTIVE_NAMES}
+    objective_rewards[OBJECTIVE_NAMES[0]] = reward
+
+    with pytest.raises(ValueError, match=message):
+        algorithm.process_env_step(
+            obs,
+            torch.zeros(NUM_ENVS),
+            torch.zeros(NUM_ENVS),
+            {"objective_rewards": objective_rewards},
+        )
+
+
+def test_positional_objective_reward_tensor_is_rejected() -> None:
+    """A positional matrix cannot bypass the named objective contract."""
+    algorithm, obs = _build_algorithm()
+    algorithm.act(obs)
+
+    with pytest.raises(ValueError, match="to be a mapping"):
+        algorithm.process_env_step(
+            obs,
+            torch.zeros(NUM_ENVS),
+            torch.zeros(NUM_ENVS),
+            {"objective_rewards": torch.zeros(NUM_ENVS, len(OBJECTIVE_NAMES))},
         )
 
 
@@ -150,15 +199,15 @@ def test_objective_reward_extras_reject_non_finite_values(non_finite: float) -> 
     """The authoritative reward vector cannot bypass the runner's scalar reward checks."""
     algorithm, obs = _build_algorithm()
     algorithm.act(obs)
-    objective_rewards = torch.zeros(NUM_ENVS, len(OBJECTIVE_NAMES))
-    objective_rewards[0, 0] = non_finite
+    objective_rewards = {name: torch.zeros(NUM_ENVS) for name in OBJECTIVE_NAMES}
+    objective_rewards[OBJECTIVE_NAMES[0]][0] = non_finite
 
     with pytest.raises(ValueError, match="only finite values"):
         algorithm.process_env_step(
             obs,
             torch.zeros(NUM_ENVS),
             torch.zeros(NUM_ENVS),
-            {OBJECTIVE_REWARDS_KEY: objective_rewards},
+            {"objective_rewards": objective_rewards},
         )
 
 

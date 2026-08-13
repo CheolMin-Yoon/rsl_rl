@@ -12,7 +12,7 @@ from tensordict import TensorDict
 
 import pytest
 
-from rsl_rl.algorithms import OBJECTIVE_REWARDS_KEY, MultiCriticPPO
+from rsl_rl.algorithms import MultiCriticPPO
 from rsl_rl.env import VecEnv
 from rsl_rl.runners import OnPolicyRunner
 
@@ -21,7 +21,7 @@ REWARD_GROUP_WEIGHTS = (0.5, 1.5, 2.0)
 
 
 class MultiCriticEnv(VecEnv):
-    """Minimal vector environment exposing ordered objective rewards."""
+    """Minimal vector environment exposing named objective rewards."""
 
     def __init__(self) -> None:
         """Initialize a CPU-only test environment."""
@@ -40,21 +40,21 @@ class MultiCriticEnv(VecEnv):
         )
 
     def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
-        """Advance one step and expose the ordered objective reward tensor."""
+        """Advance one step and expose objective rewards in reverse name order."""
         self.episode_length_buf += 1
         observations = self.get_observations()
-        objective_rewards = torch.stack(
-            (
-                1.0 - actions.square().mean(dim=-1),
-                actions[:, 0],
-                -actions[:, 1].abs(),
-            ),
-            dim=-1,
-        )
-        rewards = objective_rewards.sum(dim=-1)
+        locomotion_reward = 1.0 - actions.square().mean(dim=-1)
+        manipulation_reward = actions[:, 0]
+        tracking_reward = -actions[:, 1].abs()
+        objective_rewards = {
+            "tracking": tracking_reward,
+            "manipulation": manipulation_reward,
+            "locomotion": locomotion_reward,
+        }
+        rewards = locomotion_reward + manipulation_reward + tracking_reward
         dones = torch.zeros(self.num_envs)
         extras = {
-            OBJECTIVE_REWARDS_KEY: objective_rewards,
+            "objective_rewards": objective_rewards,
             "time_outs": torch.zeros(self.num_envs),
         }
         return observations, rewards, dones, extras
@@ -107,6 +107,16 @@ def test_stock_runner_constructs_learns_and_exports_multi_critic_policy() -> Non
     assert runner.get_inference_policy()(observations).shape == (runner.env.num_envs, runner.env.num_actions)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for cross-device reward routing.")
+def test_stock_runner_moves_cpu_objective_rewards_to_cuda_learner() -> None:
+    """CPU objective rewards should reach CUDA storage without a custom runner."""
+    runner = OnPolicyRunner(MultiCriticEnv(), _make_config(), log_dir=None, device="cuda")
+
+    runner.learn(num_learning_iterations=1)
+
+    assert torch.device(runner.alg.storage.device).type == "cuda"
+
+
 def test_stock_runner_rejects_one_objective_name_string() -> None:
     """Runner configuration requires an ordered sequence rather than character splitting."""
     config = _make_config()
@@ -114,6 +124,19 @@ def test_stock_runner_rejects_one_objective_name_string() -> None:
 
     with pytest.raises(ValueError, match="not one string"):
         OnPolicyRunner(MultiCriticEnv(), config, log_dir=None, device="cpu")
+
+
+def test_mjlab_style_config_without_optional_extension_keys_learns() -> None:
+    """MJLab's base PPO dataclass omits RND and symmetry keys when unused."""
+    config = _make_config()
+    config["algorithm"].pop("rnd_cfg")
+    config["algorithm"].pop("symmetry_cfg")
+    runner = OnPolicyRunner(MultiCriticEnv(), config, log_dir=None, device="cpu")
+
+    runner.learn(num_learning_iterations=1)
+
+    assert runner.cfg["algorithm"]["rnd_cfg"] is None
+    assert runner.cfg["algorithm"]["symmetry_cfg"] is None
 
 
 def test_stock_runner_save_and_load_restores_actor_and_ordered_critics() -> None:

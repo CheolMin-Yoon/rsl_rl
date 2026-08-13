@@ -34,15 +34,33 @@ train_cfg["algorithm"] = {
 }
 ```
 
-The environment must return `extras["objective_rewards"]` as a floating tensor with exact shape
-`[num_envs, num_objectives]`. Its final axis follows `objective_names` exactly; the ordinary scalar `rewards` tensor is
-left unchanged for runner logging. Each objective GAE is normalized over the completed rollout, then
-`reward_group_weights` forms the actor advantage. Checkpoints store and require exact objective order and weight values.
+The environment must return `extras["objective_rewards"]` as a mapping from every configured objective name to a
+floating tensor with exact shape `[num_envs]`. Mapping order is irrelevant; the algorithm stacks rewards internally in
+`objective_names` order. The ordinary scalar `rewards` tensor is left unchanged for runner logging. Each objective GAE
+is normalized over the completed rollout, then `reward_group_weights` forms the actor advantage. Checkpoints store and
+require exact objective order and weight values.
 
 Feed-forward models and `torch.compile` are supported. Actor/critic broadcast and gradient all-reduce use the stock
 multi-GPU lifecycle; this fork's tests cover those hooks, not a multi-process NCCL run. Recurrent models, RND, symmetry,
 per-mini-batch advantage normalization, and shared actor/critic parameters are intentionally rejected because they do
 not yet have an unambiguous multi-critic contract.
+
+The HoST compatibility boundary is deliberately narrow: vector GAE, objective-wise complete-rollout normalization
+using sample standard deviation, and post-normalization fixed weighting are reference-compatible. This fork still uses
+all collected transitions, guards the one-sample normalization case, validates ordered objective identity in
+checkpoints, and omits HoST's observation-interpolation smoothness loss. Those are intentional correctness and
+framework-lifecycle differences, not reproduction gaps.
+
+## Fork Extension: Multi-Policy PPO
+
+`MultiPolicyPPO` composes one independent stock `PPO` per named physical policy while retaining the stock
+`OnPolicyRunner`. Each policy owns its actor, critic, optimizer, rollout storage, observations, action width, and PPO
+configuration. Joint actions and checkpoints follow policy declaration order.
+
+The environment must return `extras["policy_rewards"]` as a mapping from every policy name to a floating tensor with
+shape `[num_envs]`; mapping order is irrelevant. Rewards are moved to the learner device and routed by name. The
+ordinary scalar `rewards` tensor remains available to the stock logger. Joint JIT/ONNX export, recurrent models, RND,
+and symmetry are intentionally outside this minimal composition contract.
 
 ## Learning Environments
 

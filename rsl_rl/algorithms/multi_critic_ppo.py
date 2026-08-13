@@ -24,9 +24,6 @@ from rsl_rl.models import MLPModel
 from rsl_rl.storage import MultiCriticRolloutStorage, RolloutStorage
 from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
 
-OBJECTIVE_REWARDS_KEY = "objective_rewards"
-"""Key in ``extras`` containing rewards with shape ``[num_envs, num_objectives]``."""
-
 
 class MultiCriticPPO:
     """PPO with one actor and ordered independent scalar critics."""
@@ -163,6 +160,36 @@ class MultiCriticPPO:
         """Evaluate every scalar critic in objective order."""
         return torch.cat([self.critics[name](obs) for name in self.objective_names], dim=-1)
 
+    def _stack_objective_rewards(self, objective_rewards: object) -> torch.Tensor:
+        """Validate named objective rewards and stack them in critic order."""
+        if not isinstance(objective_rewards, Mapping):
+            raise ValueError("MultiCriticPPO requires extras['objective_rewards'] to be a mapping.")
+
+        expected_names = set(self.objective_names)
+        actual_names = set(objective_rewards)
+        if actual_names != expected_names:
+            missing = tuple(name for name in self.objective_names if name not in actual_names)
+            extra = tuple(name for name in objective_rewards if name not in expected_names)
+            raise ValueError(f"Objective reward names do not match; missing={missing}, extra={extra}.")
+
+        ordered_rewards: list[torch.Tensor] = []
+        for name in self.objective_names:
+            reward = objective_rewards[name]
+            if not isinstance(reward, torch.Tensor):
+                raise ValueError(f"Objective reward {name!r} must be a torch.Tensor.")
+            if tuple(reward.shape) != (self.storage.num_envs,):
+                raise ValueError(
+                    f"Objective reward {name!r} must have shape {(self.storage.num_envs,)}, got {tuple(reward.shape)}."
+                )
+            if not reward.is_floating_point():
+                raise ValueError(f"Objective reward {name!r} must use a floating dtype, got {reward.dtype}.")
+            ordered_rewards.append(reward.to(self.device))
+
+        stacked_rewards = torch.stack(ordered_rewards, dim=-1)
+        if not torch.isfinite(stacked_rewards).all():
+            raise ValueError("Objective rewards must contain only finite values.")
+        return stacked_rewards
+
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actor actions and record all objective values."""
         self.transition.hidden_states = (self.actor.get_hidden_state(), None)
@@ -176,20 +203,10 @@ class MultiCriticPPO:
         return self.transition.actions  # type: ignore
 
     def process_env_step(
-        self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
+        self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, object]
     ) -> None:
         """Record one vector-reward environment step and update normalizers."""
-        objective_rewards = extras.get(OBJECTIVE_REWARDS_KEY)
-        expected_shape = (self.storage.num_envs, len(self.objective_names))
-        if not isinstance(objective_rewards, torch.Tensor) or tuple(objective_rewards.shape) != expected_shape:
-            raise ValueError(
-                f"MultiCriticPPO requires extras[{OBJECTIVE_REWARDS_KEY!r}] with shape {expected_shape}, "
-                f"got {getattr(objective_rewards, 'shape', None)}."
-            )
-        if not torch.is_floating_point(objective_rewards):
-            raise ValueError(f"extras[{OBJECTIVE_REWARDS_KEY!r}] must be a floating-point tensor.")
-        if not torch.isfinite(objective_rewards).all():
-            raise ValueError(f"extras[{OBJECTIVE_REWARDS_KEY!r}] must contain only finite values.")
+        objective_rewards = self._stack_objective_rewards(extras.get("objective_rewards"))
         if rewards.numel() != self.storage.num_envs:
             raise ValueError(f"rewards must contain {self.storage.num_envs} scalar environment rewards.")
 
@@ -197,12 +214,12 @@ class MultiCriticPPO:
         for critic in self.critics.values():
             critic.update_normalization(obs)  # type: ignore[attr-defined]
 
-        self.transition.rewards = objective_rewards.clone().to(self.device)
+        self.transition.rewards = objective_rewards
         self.transition.dones = dones
 
         if "time_outs" in extras:
             time_outs = extras["time_outs"]
-            if time_outs.numel() != self.storage.num_envs:
+            if not isinstance(time_outs, torch.Tensor) or time_outs.numel() != self.storage.num_envs:
                 raise ValueError(f"time_outs must contain {self.storage.num_envs} entries.")
             self.transition.rewards += self.gamma * self.transition.values * time_outs.to(self.device).view(-1, 1)  # type: ignore[operator]
 
@@ -389,6 +406,11 @@ class MultiCriticPPO:
             raise ValueError("objective_names must contain at least one non-empty string.")
         if len(set(objective_names)) != len(objective_names):
             raise ValueError("objective_names must be unique.")
+        # MJLab's base PPO dataclass omits optional extension keys. Preserve the
+        # stock runner's resolved-config shape so its logging path can safely
+        # inspect these fields even though MultiCriticPPO rejects non-None use.
+        algorithm_cfg.setdefault("rnd_cfg", None)
+        algorithm_cfg.setdefault("symmetry_cfg", None)
         if algorithm_cfg.pop("share_cnn_encoders", False):
             raise ValueError("MultiCriticPPO requires independent actor and critic parameters.")
 

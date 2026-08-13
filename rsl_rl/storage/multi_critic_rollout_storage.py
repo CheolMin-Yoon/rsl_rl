@@ -149,7 +149,9 @@ class MultiCriticRolloutStorage:
         objective_advantages = self.returns - self.values
         mean = objective_advantages.mean(dim=(0, 1), keepdim=True)
         if self.num_envs * self.num_transitions_per_env > 1:
-            std = objective_advantages.std(dim=(0, 1), keepdim=True)
+            # HoST uses torch.std()'s sample-standard-deviation semantics. Keep the correction explicit so the
+            # reference-compatible normalization does not change if a framework default changes.
+            std = objective_advantages.std(dim=(0, 1), keepdim=True, correction=1)
         else:
             std = torch.zeros_like(mean)
         normalized = (objective_advantages - mean) / (std + 1.0e-8)
