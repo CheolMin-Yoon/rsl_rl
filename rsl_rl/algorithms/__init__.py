@@ -9,5 +9,6 @@ from .distillation import Distillation
 from .multi_critic_ppo import MultiCriticPPO
 from .multi_policy_ppo import MultiPolicyPPO
 from .ppo import PPO
+from .sequential_multi_policy_ppo import SequentialMultiPolicyPPO
 
-__all__ = ["PPO", "Distillation", "MultiCriticPPO", "MultiPolicyPPO"]
+__all__ = ["PPO", "Distillation", "MultiCriticPPO", "MultiPolicyPPO", "SequentialMultiPolicyPPO"]
