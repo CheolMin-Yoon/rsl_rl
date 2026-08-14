@@ -7,11 +7,11 @@
 
 from __future__ import annotations
 
+import torch
 from pathlib import Path
+from tensordict import TensorDict
 
 import pytest
-import torch
-from tensordict import TensorDict
 
 from rsl_rl.algorithms import MultiPolicyPPO, SequentialMultiPolicyPPO
 from rsl_rl.env import VecEnv
@@ -22,10 +22,23 @@ CONTACT_ACTIONS = 2
 JOINT_ACTIONS = 3
 
 
+def _contact_message(obs: TensorDict, action: torch.Tensor) -> torch.Tensor:
+    """Expose both the sampled proposal and a deterministic accepted preview."""
+    del obs
+    return torch.cat((action, 1.0 - action), dim=-1)
+
+
+def _alternate_contact_message(obs: TensorDict, action: torch.Tensor) -> torch.Tensor:
+    """Return the same shape under a deliberately different checkpoint identity."""
+    del obs
+    return torch.cat((action, action), dim=-1)
+
+
 class SequentialPolicyEnv(VecEnv):
     """Minimal environment with categorical contact and continuous joint actions."""
 
     def __init__(self) -> None:
+        """Initialize the fixed-shape mock environment."""
         self.num_envs = NUM_ENVS
         self.num_actions = CONTACT_ACTIONS + JOINT_ACTIONS
         self.max_episode_length = 20
@@ -84,9 +97,9 @@ def _ppo_config() -> dict:
     }
 
 
-def _make_config() -> dict:
+def _make_config(*, transformed_message: bool = False) -> dict:
     """Return the public sequential policy configuration."""
-    return {
+    cfg = {
         "num_steps_per_env": 4,
         "save_interval": 100,
         "algorithm": {"class_name": "SequentialMultiPolicyPPO"},
@@ -94,29 +107,33 @@ def _make_config() -> dict:
             "contact": {
                 "num_actions": CONTACT_ACTIONS,
                 "obs_groups": {"actor": ("contact_actor",), "critic": ("contact_critic",)},
-                "actor": _model_config(
-                    {
-                        "class_name": "CategoricalDistribution",
-                        "num_categories": 2,
-                    }
-                ),
+                "actor": _model_config({
+                    "class_name": "CategoricalDistribution",
+                    "num_categories": 2,
+                }),
                 "critic": _model_config(None),
                 "algorithm": _ppo_config(),
             },
             "joint": {
                 "num_actions": JOINT_ACTIONS,
                 "obs_groups": {"actor": ("joint_actor",), "critic": ("joint_critic",)},
-                "actor": _model_config(
-                    {
-                        "class_name": "GaussianDistribution",
-                        "init_std": 0.5,
-                    }
-                ),
+                "actor": _model_config({
+                    "class_name": "GaussianDistribution",
+                    "init_std": 0.5,
+                }),
                 "critic": _model_config(None),
                 "algorithm": _ppo_config(),
             },
         },
     }
+    if transformed_message:
+        cfg["policy_messages"] = {
+            "contact": {
+                "dim": 2 * CONTACT_ACTIONS,
+                "func": _contact_message,
+            }
+        }
+    return cfg
 
 
 def _build_runner() -> OnPolicyRunner:
@@ -162,15 +179,108 @@ def test_joint_policy_stores_same_timestep_contact_action() -> None:
     )
 
 
+def test_joint_policy_stores_transformed_same_timestep_message() -> None:
+    """A pure policy message should not replace the sampled environment action."""
+    runner = OnPolicyRunner(
+        SequentialPolicyEnv(),
+        _make_config(transformed_message=True),
+        log_dir=None,
+        device="cpu",
+    )
+    observations = runner.env.get_observations()
+
+    actions = runner.alg.act(observations)
+    dependency_key = runner.alg.algorithms[1].actor.obs_groups[-1]
+    contact_action = actions[:, :CONTACT_ACTIONS]
+    expected_message = _contact_message(observations, contact_action)
+
+    assert runner.alg.algorithms[1].actor.obs_dim == 4 + 2 * CONTACT_ACTIONS
+    torch.testing.assert_close(
+        runner.alg.algorithms[0].transition.actions,
+        contact_action,
+    )
+    torch.testing.assert_close(
+        runner.alg.algorithms[1].transition.observations[dependency_key],
+        expected_message,
+    )
+
+    next_observations, rewards, dones, extras = runner.env.step(actions)
+    runner.alg.process_env_step(next_observations, rewards, dones, extras)
+    torch.testing.assert_close(
+        runner.alg.algorithms[1].storage.observations[0][dependency_key],
+        expected_message,
+    )
+
+
+def test_deterministic_inference_uses_transformed_message(tmp_path: Path) -> None:
+    """Inference and checkpoint restore should preserve the message transform."""
+    runner = OnPolicyRunner(
+        SequentialPolicyEnv(),
+        _make_config(transformed_message=True),
+        log_dir=None,
+        device="cpu",
+    )
+    observations = runner.env.get_observations()
+    dependency_key = runner.alg.algorithms[1].actor.obs_groups[-1]
+
+    contact_action = runner.alg.algorithms[0].get_policy()(observations.select(*runner.alg.observation_keys[0]))
+    joint_observations = observations.select(*runner.alg.observation_keys[1])
+    joint_observations.set(dependency_key, _contact_message(observations, contact_action))
+    joint_action = runner.alg.algorithms[1].get_policy()(joint_observations)
+
+    expected_actions = torch.cat((contact_action, joint_action), dim=-1)
+    torch.testing.assert_close(runner.get_inference_policy()(observations), expected_actions)
+
+    checkpoint_path = tmp_path / "transformed_sequential_multi_policy.pt"
+    runner.save(str(checkpoint_path))
+    restored = OnPolicyRunner(
+        SequentialPolicyEnv(),
+        _make_config(transformed_message=True),
+        log_dir=None,
+        device="cpu",
+    )
+    restored.load(str(checkpoint_path))
+    torch.testing.assert_close(restored.get_inference_policy()(observations), expected_actions)
+
+    mismatched_cfg = _make_config(transformed_message=True)
+    mismatched_cfg["policy_messages"]["contact"]["func"] = _alternate_contact_message
+    mismatched = OnPolicyRunner(SequentialPolicyEnv(), mismatched_cfg, log_dir=None, device="cpu")
+    with pytest.raises(ValueError, match="policy messages"):
+        mismatched.load(str(checkpoint_path))
+
+
+def test_message_shape_is_validated_before_environment_step() -> None:
+    """A declared message width must match the transform output exactly."""
+    cfg = _make_config(transformed_message=True)
+    cfg["policy_messages"]["contact"]["dim"] = CONTACT_ACTIONS
+    runner = OnPolicyRunner(SequentialPolicyEnv(), cfg, log_dir=None, device="cpu")
+
+    with pytest.raises(ValueError, match="message must have shape"):
+        runner.alg.act(runner.env.get_observations())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for policy-message device validation.")
+def test_transformed_message_completes_one_cuda_update() -> None:
+    """The transform should preserve the learner device through one stock-runner update."""
+    runner = OnPolicyRunner(
+        SequentialPolicyEnv(),
+        _make_config(transformed_message=True),
+        log_dir=None,
+        device="cuda",
+    )
+
+    runner.learn(num_learning_iterations=1)
+
+    assert all(torch.device(algorithm.storage.device).type == "cuda" for algorithm in runner.alg.algorithms)
+
+
 def test_deterministic_inference_is_sequential_and_survives_checkpoint(tmp_path: Path) -> None:
     """Inference should use contact argmax before joint mean and survive save/load."""
     runner = _build_runner()
     observations = runner.env.get_observations()
     dependency_key = runner.alg.algorithms[1].actor.obs_groups[-1]
 
-    contact_action = runner.alg.algorithms[0].get_policy()(
-        observations.select(*runner.alg.observation_keys[0])
-    )
+    contact_action = runner.alg.algorithms[0].get_policy()(observations.select(*runner.alg.observation_keys[0]))
     joint_observations = observations.select(*runner.alg.observation_keys[1])
     joint_observations.set(dependency_key, contact_action)
     joint_action = runner.alg.algorithms[1].get_policy()(joint_observations)

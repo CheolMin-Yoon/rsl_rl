@@ -8,33 +8,17 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping
-
 import torch
 import torch.nn as nn
+from collections.abc import Callable, Mapping
 from tensordict import TensorDict
 
 from rsl_rl.algorithms.multi_policy_ppo import MultiPolicyPPO
 from rsl_rl.algorithms.ppo import PPO
 from rsl_rl.env import VecEnv
+from rsl_rl.utils import resolve_callable
 
-
-def _action_observation_key(policy_name: str) -> str:
-    """Return the private observation key carrying one preceding policy action."""
-    return f"_sequential_multi_policy_{policy_name}_action"
-
-
-def _policy_observation(
-    obs: TensorDict,
-    observation_keys: tuple[str, ...],
-    dependencies: tuple[str, ...],
-    actions: Mapping[str, torch.Tensor],
-) -> TensorDict:
-    """Select environment observations and append same-timestep preceding actions."""
-    policy_obs = obs.select(*observation_keys)
-    for dependency in dependencies:
-        policy_obs.set(_action_observation_key(dependency), actions[dependency])
-    return policy_obs
+_MessageTransform = Callable[[TensorDict, torch.Tensor], torch.Tensor]
 
 
 class _SequentialJointPolicy(nn.Module):
@@ -46,24 +30,33 @@ class _SequentialJointPolicy(nn.Module):
         policy_names: tuple[str, ...],
         observation_keys: tuple[tuple[str, ...], ...],
         policy_dependencies: tuple[tuple[str, ...], ...],
+        message_transforms: tuple[_MessageTransform, ...],
+        message_dims: tuple[int, ...],
     ) -> None:
         super().__init__()
         self.actors = nn.ModuleList(algorithm.get_policy() for algorithm in algorithms)
         self.policy_names = policy_names
         self.observation_keys = observation_keys
         self.policy_dependencies = policy_dependencies
+        self.message_transforms = message_transforms
+        self.message_dims = message_dims
 
     def forward(self, obs: TensorDict) -> torch.Tensor:
         """Return deterministic actions conditioned on all preceding policy actions."""
         actions: dict[str, torch.Tensor] = {}
-        for name, actor, keys, dependencies in zip(
+        messages: dict[str, torch.Tensor] = {}
+        for name, actor, keys, dependencies, transform, message_dim in zip(
             self.policy_names,
             self.actors,
             self.observation_keys,
             self.policy_dependencies,
+            self.message_transforms,
+            self.message_dims,
             strict=True,
         ):
-            actions[name] = actor(_policy_observation(obs, keys, dependencies, actions))
+            action = actor(_policy_observation(obs, keys, dependencies, messages))
+            actions[name] = action
+            messages[name] = _policy_message(name, obs, action, transform, message_dim)
         return torch.cat([actions[name] for name in self.policy_names], dim=-1)
 
     @property
@@ -99,26 +92,30 @@ class SequentialMultiPolicyPPO(MultiPolicyPPO):
 
         super().__init__(algorithms, policy_names, environment_observation_keys, num_envs)
         self.policy_dependencies = policy_dependencies
-        self._last_actions: dict[str, torch.Tensor] | None = None
-        self._policy = _SequentialJointPolicy(
-            algorithms,
-            policy_names,
-            environment_observation_keys,
-            policy_dependencies,
+        self._last_messages: dict[str, torch.Tensor] | None = None
+        action_dims = tuple(algorithm.storage.actions_shape[-1] for algorithm in algorithms)
+        self._configure_policy_messages(
+            tuple(_identity_message for _ in policy_names),
+            action_dims,
         )
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample each action after injecting all same-timestep preceding actions."""
         actions: dict[str, torch.Tensor] = {}
-        for name, algorithm, keys, dependencies in zip(
+        messages: dict[str, torch.Tensor] = {}
+        for name, algorithm, keys, dependencies, transform, message_dim in zip(
             self.policy_names,
             self.algorithms,
             self.observation_keys,
             self.policy_dependencies,
+            self.message_transforms,
+            self.message_dims,
             strict=True,
         ):
-            actions[name] = algorithm.act(_policy_observation(obs, keys, dependencies, actions))
-        self._last_actions = actions
+            action = algorithm.act(_policy_observation(obs, keys, dependencies, messages))
+            actions[name] = action
+            messages[name] = _policy_message(name, obs, action, transform, message_dim)
+        self._last_messages = messages
         return torch.cat([actions[name] for name in self.policy_names], dim=-1)
 
     def process_env_step(
@@ -126,12 +123,12 @@ class SequentialMultiPolicyPPO(MultiPolicyPPO):
     ) -> None:
         """Store conditioned observations and route named rewards to each PPO."""
         policy_rewards = self._stack_policy_rewards(extras.get("policy_rewards"))
-        actions = self._require_last_actions()
+        messages = self._require_last_messages()
         for policy_index, (algorithm, keys, dependencies) in enumerate(
             zip(self.algorithms, self.observation_keys, self.policy_dependencies, strict=True)
         ):
             algorithm.process_env_step(
-                _policy_observation(obs, keys, dependencies, actions),
+                _policy_observation(obs, keys, dependencies, messages),
                 policy_rewards[:, policy_index],
                 dones,
                 extras,  # type: ignore[arg-type]
@@ -139,14 +136,36 @@ class SequentialMultiPolicyPPO(MultiPolicyPPO):
 
     def compute_returns(self, obs: TensorDict) -> None:
         """Compute each PPO return using its complete conditioned observation schema."""
-        actions = self._require_last_actions()
+        messages = self._require_last_messages()
         for algorithm, keys, dependencies in zip(
             self.algorithms,
             self.observation_keys,
             self.policy_dependencies,
             strict=True,
         ):
-            algorithm.compute_returns(_policy_observation(obs, keys, dependencies, actions))
+            algorithm.compute_returns(_policy_observation(obs, keys, dependencies, messages))
+
+    def save(self) -> dict:
+        """Save policy states together with their message-transform identity."""
+        saved_dict = super().save()
+        saved_dict["policy_messages"] = tuple(
+            zip(self.policy_names, self.message_dims, self.message_transform_ids, strict=True)
+        )
+        return saved_dict
+
+    def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
+        """Reject checkpoints whose sequential message contract differs."""
+        expected_messages = tuple(zip(self.policy_names, self.message_dims, self.message_transform_ids, strict=True))
+        checkpoint_messages = loaded_dict.get("policy_messages")
+        identity_only = all(transform is _identity_message for transform in self.message_transforms)
+        if checkpoint_messages is None:
+            if not identity_only:
+                raise ValueError("Checkpoint does not contain the required sequential policy-message identity.")
+        elif tuple(tuple(message) for message in checkpoint_messages) != expected_messages:
+            raise ValueError(
+                f"Checkpoint policy messages {checkpoint_messages!r} do not match required {expected_messages!r}."
+            )
+        return super().load(loaded_dict, load_cfg, strict)
 
     @staticmethod
     def construct_algorithm(
@@ -173,6 +192,24 @@ class SequentialMultiPolicyPPO(MultiPolicyPPO):
                 raise ValueError(f"Policy {name!r} num_actions must be a positive integer.")
             action_dims[name] = action_dim
 
+        policy_messages = prepared_cfg.pop("policy_messages", {})
+        if not isinstance(policy_messages, Mapping):
+            raise ValueError("SequentialMultiPolicyPPO policy_messages must be a mapping.")
+        unknown_message_policies = tuple(name for name in policy_messages if name not in policies)
+        if unknown_message_policies:
+            raise ValueError(f"Unknown sequential policy messages: {unknown_message_policies}.")
+
+        message_dims = dict(action_dims)
+        message_transforms: dict[str, _MessageTransform] = {name: _identity_message for name in policy_names}
+        for name, message_cfg in policy_messages.items():
+            if not isinstance(message_cfg, Mapping) or set(message_cfg) != {"dim", "func"}:
+                raise ValueError(f"Policy {name!r} message must define exactly dim and func.")
+            message_dim = message_cfg["dim"]
+            if isinstance(message_dim, bool) or not isinstance(message_dim, int) or message_dim <= 0:
+                raise ValueError(f"Policy {name!r} message dim must be a positive integer.")
+            message_dims[name] = message_dim
+            message_transforms[name] = resolve_callable(message_cfg["func"])  # type: ignore[assignment]
+
         augmented_obs = obs.clone()
         for index, (name, policy) in enumerate(policies.items()):
             obs_groups = policy.get("obs_groups")
@@ -194,7 +231,7 @@ class SequentialMultiPolicyPPO(MultiPolicyPPO):
                     )
                 augmented_obs.set(
                     dependency_key,
-                    reference.new_zeros((env.num_envs, action_dims[dependency])),
+                    reference.new_zeros((env.num_envs, message_dims[dependency])),
                 )
                 dependency_keys.append(dependency_key)
             policy["obs_groups"] = {
@@ -205,10 +242,86 @@ class SequentialMultiPolicyPPO(MultiPolicyPPO):
         algorithm = MultiPolicyPPO.construct_algorithm(augmented_obs, env, prepared_cfg, device)
         if not isinstance(algorithm, SequentialMultiPolicyPPO):
             raise TypeError("SequentialMultiPolicyPPO construction resolved the wrong algorithm class.")
+        algorithm._configure_policy_messages(
+            tuple(message_transforms[name] for name in policy_names),
+            tuple(message_dims[name] for name in policy_names),
+        )
         return algorithm
 
-    def _require_last_actions(self) -> dict[str, torch.Tensor]:
-        """Return the latest actions after enforcing the stock runner lifecycle."""
-        if self._last_actions is None:
+    def _configure_policy_messages(
+        self,
+        message_transforms: tuple[_MessageTransform, ...],
+        message_dims: tuple[int, ...],
+    ) -> None:
+        """Configure pure same-timestep messages without changing PPO actions."""
+        if len(message_transforms) != len(self.policy_names) or len(message_dims) != len(self.policy_names):
+            raise ValueError("Sequential policy-message configuration must match the ordered policy count.")
+        self.message_transforms = message_transforms
+        self.message_dims = message_dims
+        self.message_transform_ids = tuple(_callable_identity(transform) for transform in message_transforms)
+        self._policy = _SequentialJointPolicy(
+            self.algorithms,
+            self.policy_names,
+            self.observation_keys,
+            self.policy_dependencies,
+            self.message_transforms,
+            self.message_dims,
+        )
+
+    def _require_last_messages(self) -> dict[str, torch.Tensor]:
+        """Return the latest messages after enforcing the stock runner lifecycle."""
+        if self._last_messages is None:
             raise RuntimeError("SequentialMultiPolicyPPO.act() must be called before processing a rollout step.")
-        return self._last_actions
+        return self._last_messages
+
+
+def _action_observation_key(policy_name: str) -> str:
+    """Return the private observation key carrying one preceding policy action."""
+    return f"_sequential_multi_policy_{policy_name}_action"
+
+
+def _identity_message(obs: TensorDict, action: torch.Tensor) -> torch.Tensor:
+    """Use the sampled action itself as the default inter-policy message."""
+    del obs
+    return action
+
+
+def _callable_identity(transform: _MessageTransform) -> str:
+    """Return a stable checkpoint identity for one message transform."""
+    return f"{transform.__module__}:{transform.__qualname__}"
+
+
+def _policy_message(
+    policy_name: str,
+    obs: TensorDict,
+    action: torch.Tensor,
+    transform: _MessageTransform,
+    message_dim: int,
+) -> torch.Tensor:
+    """Build and validate the message exposed to dependent policies."""
+    message = transform(obs, action)
+    if not isinstance(message, torch.Tensor):
+        raise TypeError(f"Policy {policy_name!r} message transform must return a torch.Tensor.")
+    expected_shape = (*action.shape[:-1], message_dim)
+    if tuple(message.shape) != expected_shape:
+        raise ValueError(
+            f"Policy {policy_name!r} message must have shape {expected_shape}, got {tuple(message.shape)}."
+        )
+    if message.device != action.device:
+        raise ValueError(f"Policy {policy_name!r} message must use device {action.device}, got {message.device}.")
+    if message.dtype != action.dtype:
+        raise ValueError(f"Policy {policy_name!r} message must use dtype {action.dtype}, got {message.dtype}.")
+    return message
+
+
+def _policy_observation(
+    obs: TensorDict,
+    observation_keys: tuple[str, ...],
+    dependencies: tuple[str, ...],
+    messages: Mapping[str, torch.Tensor],
+) -> TensorDict:
+    """Select environment observations and append same-timestep policy messages."""
+    policy_obs = obs.select(*observation_keys)
+    for dependency in dependencies:
+        policy_obs.set(_action_observation_key(dependency), messages[dependency])
+    return policy_obs

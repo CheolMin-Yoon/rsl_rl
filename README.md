@@ -62,6 +62,24 @@ shape `[num_envs]`; mapping order is irrelevant. Rewards are moved to the learne
 ordinary scalar `rewards` tensor remains available to the stock logger. Joint JIT/ONNX export, recurrent models, RND,
 and symmetry are intentionally outside this minimal composition contract.
 
+`SequentialMultiPolicyPPO` additionally evaluates policies in declaration order. By default, each preceding sampled
+action is the message appended to later actor observations. An optional pure message transform can expose a different
+same-timestep message without changing the sampled action stored by PPO or sent to the environment:
+
+```python
+train_cfg["policy_messages"] = {
+    "contact": {
+        "dim": 8,
+        "func": "my_task.contact:contact_message",
+    },
+}
+```
+
+The callable receives the complete observation `TensorDict` and the sampled policy action, and returns one tensor
+with the declared final dimension on the same dtype and device. It must be deterministic and side-effect free.
+Checkpoint loading validates the ordered message dimensions and callable identities. Environment-owned state
+transitions remain in the task; the transform is only a same-timestep preview/message for dependent policies.
+
 ## Learning Environments
 
 RSL-RL is currently used by the following robot learning libraries:
