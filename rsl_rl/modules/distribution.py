@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.distributions import Beta, Normal
+from torch.distributions import Beta, Categorical, Normal
 
 
 class Distribution(nn.Module):
@@ -435,6 +435,97 @@ class BetaDistribution(Distribution):
         torch.nn.init.zeros_(mlp[-2].bias[self.output_dim :])  # type: ignore
 
 
+class CategoricalDistribution(Distribution):
+    """Independent categorical distributions over multiple action branches."""
+
+    def __init__(self, output_dim: int, num_categories: int) -> None:
+        """Initialize one categorical distribution per output dimension."""
+        super().__init__(output_dim)
+
+        if num_categories < 2:
+            raise ValueError("num_categories must be at least 2.")
+
+        self.num_categories = num_categories
+        self._distribution: Categorical | None = None
+        self._logits: torch.Tensor | None = None
+
+        Categorical.set_default_validate_args(False)
+
+    def update(self, mlp_output: torch.Tensor) -> None:
+        """Update the categorical distributions from actor logits."""
+        self._logits = mlp_output
+        self._distribution = Categorical(logits=mlp_output)
+
+    def sample(self) -> torch.Tensor:
+        """Sample one category per action branch."""
+        return self._distribution.sample().to(dtype=self._logits.dtype)  # type: ignore
+
+    def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
+        """Return the most probable category for every action branch."""
+        return torch.argmax(mlp_output, dim=-1).to(dtype=mlp_output.dtype)
+
+    def as_deterministic_output_module(self) -> nn.Module:
+        """Return an export-friendly categorical argmax module."""
+        return _CategoricalDeterministicOutput()
+
+    @property
+    def input_dim(self) -> list[int]:
+        """Return the actor-logit shape required by the distribution."""
+        return [self.output_dim, self.num_categories]
+
+    @property
+    def mean(self) -> torch.Tensor:
+        """Return the expected category index for every action branch."""
+        probabilities = self._distribution.probs  # type: ignore
+        categories = torch.arange(
+            self.num_categories,
+            device=probabilities.device,
+            dtype=probabilities.dtype,
+        )
+        return (probabilities * categories).sum(dim=-1)
+
+    @property
+    def std(self) -> torch.Tensor:
+        """Return the standard deviation of each categorical branch."""
+        probabilities = self._distribution.probs  # type: ignore
+        categories = torch.arange(
+            self.num_categories,
+            device=probabilities.device,
+            dtype=probabilities.dtype,
+        )
+        mean = self.mean.unsqueeze(-1)
+        variance = (probabilities * torch.square(categories - mean)).sum(dim=-1)
+        return torch.sqrt(variance.clamp_min(0.0))
+
+    @property
+    def entropy(self) -> torch.Tensor:
+        """Return categorical entropy summed over action branches."""
+        return self._distribution.entropy().sum(dim=-1)  # type: ignore
+
+    @property
+    def params(self) -> tuple[torch.Tensor, ...]:
+        """Return the actor logits used to reconstruct the distribution."""
+        return (self._logits,)  # type: ignore
+
+    def log_prob(self, outputs: torch.Tensor) -> torch.Tensor:
+        """Return log probability summed over action branches."""
+        return self._distribution.log_prob(outputs.long()).sum(dim=-1)  # type: ignore
+
+    def kl_divergence(
+        self,
+        old_params: tuple[torch.Tensor, ...],
+        new_params: tuple[torch.Tensor, ...],
+    ) -> torch.Tensor:
+        """Compute categorical KL(old || new), summed over action branches."""
+        (old_logits,) = old_params
+        (new_logits,) = new_params
+
+        old_distribution = Categorical(logits=old_logits)
+        new_distribution = Categorical(logits=new_logits)
+
+        return torch.distributions.kl_divergence(old_distribution, new_distribution).sum(dim=-1)
+
+
 class _IdentityDeterministicOutput(nn.Module):
     """Exportable module that returns the MLP output as is."""
 
@@ -462,3 +553,10 @@ class _BetaDeterministicOutput(nn.Module):
         alpha = torch.nn.functional.softplus(alpha_raw) + 1.0
         beta = torch.nn.functional.softplus(beta_raw) + 1.0
         return (alpha / (alpha + beta)) * self.range_scale + self.range_offset
+
+
+class _CategoricalDeterministicOutput(nn.Module):
+    """Exportable module that selects the most probable category."""
+
+    def forward(self, mlp_output: torch.Tensor) -> torch.Tensor:
+        return torch.argmax(mlp_output, dim=-1).to(dtype=mlp_output.dtype)

@@ -141,6 +141,30 @@ def test_stock_runner_constructs_and_updates_independent_policies() -> None:
         )
 
 
+def test_stock_runner_updates_categorical_and_gaussian_policies_together() -> None:
+    """MultiPolicyPPO should combine binary categorical and continuous Gaussian policies."""
+    config = _make_config()
+    config["policies"]["leg"]["actor"]["distribution_cfg"] = {
+        "class_name": "CategoricalDistribution",
+        "num_categories": 2,
+    }
+    config["policies"]["leg"]["algorithm"]["schedule"] = "adaptive"
+    config["policies"]["leg"]["algorithm"]["desired_kl"] = 0.01
+    runner = OnPolicyRunner(MultiPolicyEnv(), config, log_dir=None, device="cpu")
+
+    runner.learn(num_learning_iterations=1)
+    observations = runner.env.get_observations()
+    sampled_actions = runner.alg.act(observations)
+    deterministic_actions = runner.get_inference_policy()(observations)
+
+    assert sampled_actions.shape == (NUM_ENVS, LEG_ACTIONS + ARM_ACTIONS)
+    assert sampled_actions.dtype == torch.float32
+    assert torch.all((sampled_actions[:, :LEG_ACTIONS] == 0.0) | (sampled_actions[:, :LEG_ACTIONS] == 1.0))
+    assert torch.all(
+        (deterministic_actions[:, :LEG_ACTIONS] == 0.0) | (deterministic_actions[:, :LEG_ACTIONS] == 1.0)
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for cross-device reward routing.")
 def test_stock_runner_moves_cpu_policy_rewards_to_cuda_learner() -> None:
     """CPU environment rewards should reach every CUDA PPO storage without a custom runner."""

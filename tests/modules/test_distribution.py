@@ -8,7 +8,14 @@
 import math
 import torch
 
-from rsl_rl.modules.distribution import BetaDistribution, GaussianDistribution, HeteroscedasticGaussianDistribution
+import pytest
+
+from rsl_rl.modules.distribution import (
+    BetaDistribution,
+    CategoricalDistribution,
+    GaussianDistribution,
+    HeteroscedasticGaussianDistribution,
+)
 
 
 class TestGaussianDistribution:
@@ -314,3 +321,65 @@ class TestBetaDistribution:
         dist.log_prob(samples).sum().backward()
         assert mlp_output.grad is not None
         assert not torch.all(mlp_output.grad == 0)
+
+
+class TestCategoricalDistribution:
+    """Tests for ``CategoricalDistribution``."""
+
+    def test_samples_are_exact_category_indices(self) -> None:
+        """Samples should contain one exact category index per action branch."""
+        distribution = CategoricalDistribution(output_dim=4, num_categories=2)
+        logits = torch.randn(64, 4, 2)
+        distribution.update(logits)
+
+        samples = distribution.sample()
+
+        assert samples.shape == (64, 4)
+        assert samples.dtype == logits.dtype
+        assert torch.all((samples == 0.0) | (samples == 1.0))
+
+    def test_deterministic_output_selects_argmax(self) -> None:
+        """Deterministic inference should select the most probable category per branch."""
+        distribution = CategoricalDistribution(output_dim=4, num_categories=2)
+        logits = torch.tensor([[[4.0, -4.0], [-4.0, 4.0], [2.0, -2.0], [-2.0, 2.0]]])
+        expected = torch.tensor([[0.0, 1.0, 0.0, 1.0]])
+
+        actual = distribution.deterministic_output(logits)
+        exported = distribution.as_deterministic_output_module()(logits)
+
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(exported, expected)
+
+    def test_uniform_entropy_matches_analytical_value(self) -> None:
+        """Four independent binary branches should have entropy ``4 * log(2)`` under uniform logits."""
+        distribution = CategoricalDistribution(output_dim=4, num_categories=2)
+        distribution.update(torch.zeros(3, 4, 2))
+
+        expected = torch.full((3,), 4.0 * math.log(2.0))
+        torch.testing.assert_close(distribution.entropy, expected)
+
+    def test_identical_distribution_kl_is_zero(self) -> None:
+        """Categorical KL should be zero for identical logits."""
+        distribution = CategoricalDistribution(output_dim=4, num_categories=2)
+        distribution.update(torch.randn(3, 4, 2))
+
+        actual = distribution.kl_divergence(distribution.params, distribution.params)
+
+        torch.testing.assert_close(actual, torch.zeros(3), atol=1e-6, rtol=0.0)
+
+    def test_log_prob_gradient_flows_to_logits(self) -> None:
+        """Categorical log probability should propagate gradients to actor logits."""
+        distribution = CategoricalDistribution(output_dim=4, num_categories=2)
+        logits = torch.randn(8, 4, 2, requires_grad=True)
+        distribution.update(logits)
+        samples = distribution.sample().detach()
+
+        distribution.log_prob(samples).sum().backward()
+
+        assert logits.grad is not None
+        assert not torch.all(logits.grad == 0)
+
+    def test_rejects_single_category(self) -> None:
+        """A categorical branch must expose at least two choices."""
+        with pytest.raises(ValueError, match="at least 2"):
+            CategoricalDistribution(output_dim=4, num_categories=1)
