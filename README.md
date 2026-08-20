@@ -80,6 +80,52 @@ with the declared final dimension on the same dtype and device. It must be deter
 Checkpoint loading validates the ordered message dimensions and callable identities. Environment-owned state
 transitions remain in the task; the transform is only a same-timestep preview/message for dependent policies.
 
+## Fork Extension: RSL-Native ADD PPO
+
+`ADDPPO` keeps the stock one-actor/one-critic PPO storage, GAE, optimizer, runner, logging, and inference lifecycle while
+adding MimicKit's Adversarial Differential Discriminator (ADD) core. It is an RSL-native ADD variant, not an exact
+reproduction of MimicKit's separate actor/critic PPO optimizers and update schedule.
+
+The environment must publish the transition-aligned, pre-reset discriminator pair in
+`extras["add_live_obs"]` and `extras["add_reference_obs"]`. Both tensors must be finite `float32` values with shape
+`[num_envs, disc_obs_dim]`. Motion phase, reference generation, robot features, and reset timing remain task-owned.
+The ordinary scalar environment reward remains unchanged for stock runner logging; PPO storage receives the configured
+task/ADD reward mixture.
+
+```python
+train_cfg["algorithm"] = {
+    "class_name": "ADDPPO",
+    "task_reward_weight": 0.0,
+    "add_reward_weight": 1.0,
+    "add_cfg": {
+        "disc_obs_dim": 317,
+        "hidden_dims": (1024, 512),
+        "activation": "relu",
+        "disc_epochs": 2,
+        "disc_batch_size": 2.0,
+        "disc_buffer_size": 200_000,
+        "disc_replay_samples": 1000,
+        "disc_logit_reg": 0.01,
+        "disc_grad_penalty": 2.0,
+        "disc_reward_scale": 2.0,
+        "disc_optimizer": "sgd",
+        "disc_learning_rate": 2.5e-4,
+        "disc_momentum": 0.9,
+        "disc_weight_decay": 1.0e-4,
+        "normalizer_samples": 100_000_000,
+        "normalizer_min_diff": 1.0e-4,
+    },
+    # ordinary stock PPO settings ...
+}
+```
+
+ADD evaluates `reference - live`, rescales it without recentering, uses one exact zero row as the positive class, and
+trains negative BCE on current plus paired replay differences. Its reward is
+`-scale * log(max(1 - sigmoid(logit), 1e-4))`. Checkpoints include discriminator, optimizer, paired replay,
+normalizer, sample counter, and configuration identity; actor-only loading remains available through
+`load_cfg={"add": False, ...}`. The v1 contract supports feed-forward single-GPU execution and explicitly rejects RND,
+symmetry, recurrent models, `torch.compile`, and multi-GPU training.
+
 ## Learning Environments
 
 RSL-RL is currently used by the following robot learning libraries:

@@ -5,10 +5,14 @@
 
 """Extensions for the learning algorithms."""
 
+from .add import ADDDiscriminatorLoss, AdversarialDifferentialDiscriminator, DiffNormalizer
 from .rnd import RandomNetworkDistillation, resolve_rnd_config
 from .symmetry import Symmetry, resolve_symmetry_config
 
 __all__ = [
+    "ADDDiscriminatorLoss",
+    "AdversarialDifferentialDiscriminator",
+    "DiffNormalizer",
     "RandomNetworkDistillation",
     "Symmetry",
     "resolve_rnd_config",
